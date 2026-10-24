@@ -5,8 +5,9 @@ import {
   Rewind, FastForward, Search, Send, Share2, SkipBack, SkipForward, Smile, Volume2, VolumeX, X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { CATALOG, INITIAL_QUEUE, MOCK_LISTENERS, MOCK_MESSAGES, fmt, thumb, type Listener, type Message, type Track } from "@/lib/mock";
+import { CATALOG, INITIAL_QUEUE, fmt, thumb, type Listener, type Message, type Track } from "@/lib/mock";
 import { cn } from "@/lib/utils";
+import { socket } from "@/socket";
 
 export const Route = createFileRoute("/room/$code")({
   head: ({ params }) => ({
@@ -25,65 +26,229 @@ export const Route = createFileRoute("/room/$code")({
 const EMOJIS = ["🔥", "😍", "🎵", "🎧", "💜", "😂", "🙌", "👏", "🥹", "✨", "🕺", "💯"];
 const now = () => new Date().toTimeString().slice(0, 5);
 
-function Avatar({ l, size = "size-8" }: { l: { name: string; color: string }; size?: string }) {
+function Avatar({ l, size = "size-8" }: { l?: { name?: string; color?: string }; size?: string }) {
+  const initial = (l?.name?.trim()?.[0] || "?").toUpperCase();
+  const colorClass = l?.color || "bg-primary";
+
   return (
-    <div className={cn("grid shrink-0 place-items-center rounded-full font-display text-xs font-bold text-primary-foreground", l.color, size)}>
-      {l.name[0]?.toUpperCase()}
+    <div className={cn("grid shrink-0 place-items-center rounded-full font-display text-xs font-bold text-primary-foreground", colorClass, size)}>
+      {initial}
     </div>
   );
 }
 
 function Room() {
   const { code } = Route.useParams();
+  const cleanCode = useMemo(() => String(code || "").trim().toUpperCase(), [code]);
   const navigate = useNavigate();
-  const [me, setMe] = useState<Listener>({ id: "me", name: "You", color: "bg-avatar-6" });
+
+  // Load identity directly from storage so it never defaults to "User-Guest"
+  const [me, setMe] = useState<Listener>(() => {
+    try {
+      const s = typeof window !== "undefined" ? sessionStorage.getItem("chillx-user") : null;
+      if (s) {
+        const u = JSON.parse(s);
+        return { id: "me", name: u.name?.trim() || "You", color: u.color || "bg-avatar-6" };
+      }
+    } catch {
+      // fallback
+    }
+    return { id: "me", name: "You", color: "bg-avatar-6" };
+  });
+
   const [queue, setQueue] = useState<Track[]>(INITIAL_QUEUE);
-  const [currentId, setCurrentId] = useState(INITIAL_QUEUE[0]!.id);
+  const [currentId, setCurrentId] = useState<string>(INITIAL_QUEUE[0]?.id || "");
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [volume, setVolume] = useState(70);
   const [muted, setMuted] = useState(false);
   const [tab, setTab] = useState<"queue" | "chat">("queue");
-  const [messages, setMessages] = useState<Message[]>(MOCK_MESSAGES);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [activeUsers, setActiveUsers] = useState<Listener[]>([]);
   const [copied, setCopied] = useState(false);
+
   const frame = useRef<HTMLIFrameElement>(null);
+  const isBroadcastingRef = useRef(false);
 
-  useEffect(() => {
-    const s = sessionStorage.getItem("chillx-user");
-    if (s) { const u = JSON.parse(s); setMe({ id: "me", name: u.name || "You", color: u.color || "bg-avatar-6" }); }
-  }, []);
-
-  const listeners = useMemo(() => [...MOCK_LISTENERS, me], [me]);
   const idx = Math.max(0, queue.findIndex((t) => t.id === currentId));
   const current = queue[idx];
 
-  const cmd = (func: string, args: unknown[] = []) =>
-    frame.current?.contentWindow?.postMessage(JSON.stringify({ event: "command", func, args }), "*");
+  const cmd = (func: string, args: unknown[] = []) => {
+    frame.current?.contentWindow?.postMessage(
+      JSON.stringify({ event: "command", func, args }),
+      "*"
+    );
+  };
 
+  // 1. Room mount & Socket Listeners
+  useEffect(() => {
+    if (!cleanCode) return;
+
+    const username = me.name !== "You" ? me.name : `User-${socket.id ? socket.id.slice(0, 4) : "Guest"}`;
+    socket.emit("join_room", { roomcode: cleanCode, username });
+
+    const handleMusicPlayed = ({ currentTime }: { currentTime: number }) => {
+      isBroadcastingRef.current = true;
+      setPlaying(true);
+      setTime(currentTime);
+      cmd("seekTo", [currentTime, true]);
+      cmd("playVideo");
+      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
+    };
+
+    const handleMusicPaused = ({ currentTime }: { currentTime: number }) => {
+      isBroadcastingRef.current = true;
+      setPlaying(false);
+      if (currentTime !== undefined) {
+        setTime(currentTime);
+        cmd("seekTo", [currentTime, true]);
+      }
+      cmd("pauseVideo");
+      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
+    };
+
+    const handleMusicSeeked = ({ currentTime }: { currentTime: number }) => {
+      isBroadcastingRef.current = true;
+      setTime(currentTime);
+      cmd("seekTo", [currentTime, true]);
+      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
+    };
+
+    const handleTrackChanged = ({ trackIndex }: { trackIndex: number }) => {
+      if (queue[trackIndex]) {
+        setCurrentId(queue[trackIndex]!.id);
+        setTime(0);
+        setPlaying(true);
+      }
+    };
+
+    const handleQueueAdded = ({ song }: { song: Track }) => {
+      setQueue((prev) => [...prev, song]);
+      toast.info(`Added "${song.title}" to shared queue`);
+    };
+
+    // Chat listener: discard own broadcasts and map incoming messages to other users
+    const handleReceiveMessage = (msg: { senderId?: string; user: string; message: string; time?: string }) => {
+      if (msg.senderId && msg.senderId === socket.id) return;
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: String(Date.now() + Math.random()),
+          userId: msg.senderId || "peer",
+          name: msg.user,
+          color: "bg-avatar-2",
+          text: msg.message,
+          time: msg.time || now(),
+        },
+      ]);
+    };
+
+    const handleRoomUsers = (usersList: Array<{ id: string; username: string }>) => {
+      const mapped = usersList.map((u, i) => ({
+        id: u.id,
+        name: u.username,
+        color: `bg-avatar-${(i % 6) + 1}`,
+      }));
+      setActiveUsers(mapped);
+    };
+
+    socket.on("music_played", handleMusicPlayed);
+    socket.on("music_paused", handleMusicPaused);
+    socket.on("music_seeked", handleMusicSeeked);
+    socket.on("track_changed", handleTrackChanged);
+    socket.on("song_added_to_queue", handleQueueAdded);
+    socket.on("receive_message", handleReceiveMessage);
+    socket.on("room_users_update", handleRoomUsers);
+
+    return () => {
+      socket.off("music_played", handleMusicPlayed);
+      socket.off("music_paused", handleMusicPaused);
+      socket.off("music_seeked", handleMusicSeeked);
+      socket.off("track_changed", handleTrackChanged);
+      socket.off("song_added_to_queue", handleQueueAdded);
+      socket.off("receive_message", handleReceiveMessage);
+      socket.off("room_users_update", handleRoomUsers);
+    };
+  }, [cleanCode, me.name, queue]);
+
+  // 2. Playback progress tracking
   useEffect(() => {
     if (!playing) return;
-    const i = setInterval(() => setTime((t) => {
-      if (current && t + 1 >= current.duration) { next(); return 0; }
-      return t + 1;
-    }), 1000);
-    return () => clearInterval(i);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const interval = setInterval(() => {
+      setTime((t) => {
+        if (current && t + 1 >= current.duration) {
+          next();
+          return 0;
+        }
+        return t + 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
   }, [playing, current?.id]);
 
-  useEffect(() => { cmd(playing ? "playVideo" : "pauseVideo"); }, [playing]);
-  useEffect(() => { cmd("setVolume", [volume]); cmd(muted ? "mute" : "unMute"); }, [volume, muted]);
+  useEffect(() => {
+    cmd("setVolume", [volume]);
+    cmd(muted ? "mute" : "unMute");
+  }, [volume, muted]);
 
-  const seek = (t: number) => { const v = Math.min(Math.max(0, t), current?.duration ?? 0); setTime(v); cmd("seekTo", [v, true]); };
-  const play = (id: string) => { setCurrentId(id); setTime(0); setPlaying(true); };
-  function next() { if (queue.length) play(queue[(idx + 1) % queue.length]!.id); }
-  const prev = () => { if (time > 3) seek(0); else if (queue.length) play(queue[(idx - 1 + queue.length) % queue.length]!.id); };
+  const togglePlay = () => {
+    const nextState = !playing;
+    setPlaying(nextState);
+    if (nextState) {
+      cmd("playVideo");
+      socket.emit("play_music", { roomcode: cleanCode, currentTime: time });
+    } else {
+      cmd("pauseVideo");
+      socket.emit("pause_music", { roomcode: cleanCode, currentTime: time });
+    }
+  };
+
+  const seek = (targetTime: number) => {
+    const validTime = Math.min(Math.max(0, targetTime), current?.duration ?? 0);
+    setTime(validTime);
+    cmd("seekTo", [validTime, true]);
+    socket.emit("seek_music", { roomcode: cleanCode, currentTime: validTime });
+  };
+
+  const play = (id: string) => {
+    const selectedIdx = queue.findIndex((t) => t.id === id);
+    if (selectedIdx === -1) return;
+
+    setCurrentId(id);
+    setTime(0);
+    setPlaying(true);
+    socket.emit("change_track", { roomcode: cleanCode, trackIndex: selectedIdx });
+  };
+
+  function next() {
+    if (queue.length) {
+      const nextIndex = (idx + 1) % queue.length;
+      play(queue[nextIndex]!.id);
+    }
+  }
+
+  const prev = () => {
+    if (time > 3) {
+      seek(0);
+    } else if (queue.length) {
+      const prevIndex = (idx - 1 + queue.length) % queue.length;
+      play(queue[prevIndex]!.id);
+    }
+  };
 
   const addTrack = (t: Track) => {
-    setQueue((q) => [...q, { ...t, id: `${t.id}-${Date.now()}` }]);
+    const newTrack = { ...t, id: `${t.id}-${Date.now()}` };
+    setQueue((q) => [...q, newTrack]);
+    socket.emit("add_to_queue", { roomcode: cleanCode, song: newTrack });
     toast.success(`Added "${t.title}" to queue`);
   };
+
   const remove = (id: string) => {
-    if (id === currentId) { if (queue.length > 1) next(); else setPlaying(false); }
+    if (id === currentId) {
+      if (queue.length > 1) next();
+      else setPlaying(false);
+    }
     setQueue((q) => q.filter((t) => t.id !== id));
   };
 
@@ -92,8 +257,31 @@ function Room() {
     toast.success(label);
   };
 
-  const send = (text: string) =>
-    setMessages((m) => [...m, { id: String(Date.now()), userId: "me", name: me.name, color: me.color, text, time: now() }]);
+  const send = (text: string) => {
+    const currentName = me.name && me.name !== "You" ? me.name : "You";
+
+    // 1. Immediately place sender bubble into local state
+    const localMsg: Message = {
+      id: String(Date.now()),
+      userId: "me",
+      name: currentName,
+      color: me.color,
+      text,
+      time: now(),
+    };
+    setMessages((m) => [...m, localMsg]);
+
+    // 2. Transmit to backend
+    socket.emit("send_message", {
+      roomcode: cleanCode,
+      message: text,
+      username: currentName,
+    });
+  };
+
+  const listeners = useMemo(() => {
+    return activeUsers.length > 0 ? activeUsers : [me];
+  }, [activeUsers, me]);
 
   return (
     <div className="bg-ambient flex h-screen flex-col overflow-hidden">
@@ -103,19 +291,24 @@ function Room() {
           <span className="font-display text-xl font-bold">Chill<span className="text-primary">_X</span></span>
           <div className="flex items-center gap-1 rounded-full border border-border bg-card py-1 pl-3 pr-1">
             <span className="size-1.5 rounded-full bg-live" />
-            <span className="font-display text-xs font-semibold tracking-widest">{code}</span>
+            <span className="font-display text-xs font-semibold tracking-widest">{cleanCode}</span>
             <button
               title="Click to copy"
-              onClick={() => { copy(code, "Room code copied"); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+              onClick={() => { copy(cleanCode, "Room code copied"); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
               className="press grid size-7 place-items-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground"
             >
               {copied ? <Check className="size-3.5 text-live" /> : <Copy className="size-3.5" />}
             </button>
-            <button title="Copy share link" onClick={() => copy(window.location.href, "Invite link copied")} className="press grid size-7 place-items-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground">
+            <button
+              title="Copy share link"
+              onClick={() => copy(window.location.href, "Invite link copied")}
+              className="press grid size-7 place-items-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground"
+            >
               <Share2 className="size-3.5" />
             </button>
           </div>
         </div>
+
         <div className="flex items-center gap-3">
           <div className="hidden -space-x-2 sm:flex">
             {listeners.map((l) => (
@@ -125,14 +318,16 @@ function Room() {
                   <span className="animate-live absolute inset-0 rounded-full bg-live" />
                 </span>
                 <span className="pointer-events-none absolute left-1/2 top-10 z-50 -translate-x-1/2 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 text-xs opacity-0 transition group-hover:opacity-100">
-                  {l.name}{l.host ? " · Host" : ""}{l.id === "me" ? " (you)" : ""}
+                  {l.name}{l.id === "me" ? " (you)" : ""}
                 </span>
               </div>
             ))}
           </div>
+
           <span className="flex items-center gap-1.5 rounded-full border border-live/30 bg-live/10 px-3 py-1 text-xs font-semibold text-live">
             <Headphones className="size-3.5" /> {listeners.length} Listeners
           </span>
+
           <button onClick={() => navigate({ to: "/" })} className="press flex items-center gap-1.5 rounded-lg bg-destructive/15 px-3 py-2 text-xs font-semibold text-destructive hover:bg-destructive hover:text-destructive-foreground">
             <LogOut className="size-3.5" /> <span className="hidden sm:inline">Leave Room</span>
           </button>
@@ -144,25 +339,33 @@ function Room() {
         <main className="min-h-0 flex-1 overflow-y-auto p-4 md:p-6">
           <div className="mx-auto max-w-4xl space-y-5">
             <SearchBar onAdd={addTrack} />
+
             <div className="relative aspect-video overflow-hidden rounded-2xl border border-border bg-card shadow-screen">
               {current ? (
-                <iframe
-                  ref={frame}
-                  key={current.id}
-                  className="size-full"
-                  src={`https://www.youtube.com/embed/${current.videoId}?enablejsapi=1&controls=0&rel=0&modestbranding=1&autoplay=${playing ? 1 : 0}`}
-                  title={current.title}
-                  allow="autoplay; encrypted-media"
-                  onLoad={() => { cmd("setVolume", [volume]); if (muted) cmd("mute"); }}
-                />
+                <>
+                  <iframe
+                    ref={frame}
+                    key={current.id}
+                    className="size-full"
+                    src={`https://www.youtube.com/embed/${current.videoId}?enablejsapi=1&controls=0&rel=0&modestbranding=1&autoplay=${playing ? 1 : 0}`}
+                    title={current.title}
+                    allow="autoplay; encrypted-media"
+                    onLoad={() => {
+                      cmd("setVolume", [volume]);
+                      if (muted) cmd("mute");
+                    }}
+                  />
+                  <div className="absolute inset-0 cursor-default" />
+                </>
               ) : (
                 <div className="grid size-full place-items-center text-muted-foreground">Queue is empty — search for a track</div>
               )}
             </div>
+
             {current && (
               <PlayerCard
                 track={current} playing={playing} time={time} volume={volume} muted={muted}
-                onToggle={() => setPlaying((p) => !p)} onSeek={seek} onPrev={prev} onNext={next}
+                onToggle={togglePlay} onSeek={seek} onPrev={prev} onNext={next}
                 onVolume={(v) => { setVolume(v); if (v > 0) setMuted(false); }} onMute={() => setMuted((m) => !m)}
               />
             )}
@@ -179,6 +382,7 @@ function Room() {
               </button>
             ))}
           </div>
+
           {tab === "queue" ? (
             <QueueList queue={queue} setQueue={setQueue} currentId={currentId} playing={playing} onPlay={play} onRemove={remove} />
           ) : (
@@ -193,10 +397,44 @@ function Room() {
 function SearchBar({ onAdd }: { onAdd: (t: Track) => void }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
-  const results = useMemo(() => {
-    const s = q.trim().toLowerCase();
-    return s ? CATALOG.filter((t) => `${t.title} ${t.artist}`.toLowerCase().includes(s)) : CATALOG;
+  const [liveResults, setLiveResults] = useState<Track[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    const query = q.trim();
+    if (!query) {
+      setLiveResults(CATALOG);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setSearching(true);
+      socket.emit("search_youtube", query, (res: { success: boolean; results?: Array<{ id: string; title: string; artist: string; duration: string }> }) => {
+        setSearching(false);
+        if (res?.success && res.results && res.results.length > 0) {
+          const formatted: Track[] = res.results.map((r) => {
+            const parts = (r.duration || "3:00").split(":").map(Number);
+            const dur = parts.length === 2 ? (parts[0]! * 60 + parts[1]!) : 180;
+            return {
+              id: r.id,
+              videoId: r.id,
+              title: r.title,
+              artist: r.artist || "YouTube Artist",
+              duration: dur,
+            };
+          });
+          setLiveResults(formatted);
+        } else {
+          setLiveResults(
+            CATALOG.filter((t) => `${t.title} ${t.artist}`.toLowerCase().includes(query.toLowerCase()))
+          );
+        }
+      });
+    }, 400);
+
+    return () => clearTimeout(timer);
   }, [q]);
+
   return (
     <div className="relative z-30">
       <Search className="absolute left-4 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -204,21 +442,25 @@ function SearchBar({ onAdd }: { onAdd: (t: Track) => void }) {
         value={q}
         onChange={(e) => { setQ(e.target.value); setOpen(true); }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-        placeholder="Search YouTube tracks..."
+        onBlur={() => setTimeout(() => setOpen(false), 200)}
+        placeholder={searching ? "Searching YouTube..." : "Search YouTube tracks..."}
         className="glass h-12 w-full rounded-xl pl-11 pr-4 text-sm outline-none transition focus:ring-2 focus:ring-primary/40"
       />
       {open && (
         <div className="absolute mt-2 max-h-96 w-full overflow-y-auto rounded-xl border border-border bg-popover/95 p-1.5 shadow-2xl backdrop-blur-xl">
-          {results.length === 0 && <p className="p-4 text-center text-sm text-muted-foreground">No results for “{q}”</p>}
-          {results.map((t) => (
+          {liveResults.length === 0 && <p className="p-4 text-center text-sm text-muted-foreground">No results for “{q}”</p>}
+          {liveResults.map((t) => (
             <div key={t.id} className="group flex items-center gap-3 rounded-lg p-2 transition hover:bg-secondary">
               <img src={thumb(t.videoId)} alt="" className="h-12 w-20 rounded-md object-cover" />
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold">{t.title}</p>
                 <p className="truncate text-xs text-muted-foreground">{t.artist} · {fmt(t.duration)}</p>
               </div>
-              <button onMouseDown={(e) => e.preventDefault()} onClick={() => onAdd(t)} className="press flex shrink-0 items-center gap-1 rounded-md border border-primary/40 px-2.5 py-1.5 text-xs font-semibold text-primary hover:bg-primary hover:text-primary-foreground">
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => { onAdd(t); setOpen(false); }}
+                className="press flex shrink-0 items-center gap-1 rounded-md border border-primary/40 px-2.5 py-1.5 text-xs font-semibold text-primary hover:bg-primary hover:text-primary-foreground"
+              >
                 <Plus className="size-3.5" /> Add to Queue
               </button>
             </div>
@@ -237,6 +479,7 @@ function PlayerCard(p: {
   const pct = (p.time / p.track.duration) * 100;
   const long = p.track.title.length > 22;
   const iconBtn = "press grid size-10 place-items-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground";
+
   return (
     <div className="glass rounded-2xl p-5">
       <div className="flex flex-col gap-5 md:flex-row md:items-center">
@@ -340,44 +583,90 @@ function Chat({ messages, meId, onSend }: { messages: Message[]; meId: string; o
   const [text, setText] = useState("");
   const [emoji, setEmoji] = useState(false);
   const end = useRef<HTMLDivElement>(null);
-  useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length]);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    end.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const clean = text.trim();
+    if (!clean) return;
+
+    setText("");
+    setEmoji(false);
+    if (inputRef.current) inputRef.current.value = "";
+
+    onSend(clean);
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex-1 space-y-4 overflow-y-auto px-4 pb-3">
-        {messages.map((m) => {
-          const mine = m.userId === meId;
-          return (
-            <div key={m.id} className={cn("flex gap-2.5", mine && "flex-row-reverse")}>
-              <Avatar l={m} />
-              <div className={cn("max-w-[75%] space-y-1", mine && "items-end text-right")}>
-                <div className={cn("flex items-center gap-2 text-[11px]", mine && "justify-end")}>
-                  <span className="rounded-full bg-secondary px-2 py-0.5 font-semibold">{m.name}</span>
-                  <span className="text-muted-foreground">{m.time}</span>
+        {messages.length === 0 ? (
+          <div className="p-8 text-center text-xs text-muted-foreground">
+            No messages yet. Send a greeting to the room!
+          </div>
+        ) : (
+          messages.map((m) => {
+            const mine = m.userId === "me" || m.userId === meId;
+            return (
+              <div key={m.id} className={cn("flex gap-2.5", mine && "flex-row-reverse")}>
+                <Avatar l={{ name: m?.name || "Guest", color: m?.color || "bg-avatar-2" }} />
+                <div className={cn("max-w-[75%] space-y-1", mine && "items-end text-right")}>
+                  <div className={cn("flex items-center gap-2 text-[11px]", mine && "justify-end")}>
+                    <span className="rounded-full bg-secondary px-2 py-0.5 font-semibold">{m.name}</span>
+                    <span className="text-muted-foreground">{m.time}</span>
+                  </div>
+                  <p className={cn("inline-block rounded-2xl px-3 py-2 text-left text-sm", mine ? "rounded-tr-sm bg-primary text-primary-foreground" : "rounded-tl-sm bg-card")}>
+                    {m.text}
+                  </p>
                 </div>
-                <p className={cn("inline-block rounded-2xl px-3 py-2 text-left text-sm", mine ? "rounded-tr-sm bg-primary text-primary-foreground" : "rounded-tl-sm bg-card")}>{m.text}</p>
               </div>
-            </div>
-          );
-        })}
+            );
+          })
+        )}
         <div ref={end} />
       </div>
-      <form
-        onSubmit={(e) => { e.preventDefault(); if (text.trim()) { onSend(text.trim()); setText(""); setEmoji(false); } }}
-        className="relative border-t border-border bg-surface p-3"
-      >
+
+      <form onSubmit={handleSubmit} className="relative border-t border-border bg-surface p-3">
         {emoji && (
           <div className="absolute bottom-full left-3 mb-2 grid grid-cols-6 gap-1 rounded-xl border border-border bg-popover p-2 shadow-2xl">
             {EMOJIS.map((e) => (
-              <button type="button" key={e} onClick={() => setText((t) => t + e)} className="press size-8 rounded-md text-lg hover:bg-secondary">{e}</button>
+              <button
+                type="button"
+                key={e}
+                onClick={() => setText((prev) => prev + e)}
+                className="press size-8 rounded-md text-lg hover:bg-secondary"
+              >
+                {e}
+              </button>
             ))}
           </div>
         )}
         <div className="flex items-center gap-2">
-          <button type="button" onClick={() => setEmoji((v) => !v)} className={cn("press grid size-10 shrink-0 place-items-center rounded-lg hover:bg-secondary", emoji ? "text-primary" : "text-muted-foreground")}>
+          <button
+            type="button"
+            onClick={() => setEmoji((v) => !v)}
+            className={cn("press grid size-10 shrink-0 place-items-center rounded-lg hover:bg-secondary", emoji ? "text-primary" : "text-muted-foreground")}
+          >
             <Smile className="size-5" />
           </button>
-          <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Say something..." className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-background px-3 text-sm outline-none focus:border-primary" />
-          <button disabled={!text.trim()} className="press flex h-10 items-center gap-1.5 rounded-lg bg-primary px-3 text-sm font-semibold text-primary-foreground hover:brightness-110 disabled:opacity-40">
+          <input
+            ref={inputRef}
+            type="text"
+            autoComplete="off"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Say something..."
+            className="h-10 min-w-0 flex-1 rounded-lg border border-input bg-background px-3 text-sm outline-none focus:border-primary"
+          />
+          <button
+            type="submit"
+            disabled={!text.trim()}
+            className="press flex h-10 items-center gap-1.5 rounded-lg bg-primary px-3 text-sm font-semibold text-primary-foreground hover:brightness-110 disabled:opacity-40"
+          >
             <Send className="size-4" /> Send
           </button>
         </div>

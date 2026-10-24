@@ -4,7 +4,10 @@ export type Message = { id: string; userId: string; name: string; color: string;
 
 export const AVATAR_COLORS = ["bg-avatar-1", "bg-avatar-2", "bg-avatar-3", "bg-avatar-4", "bg-avatar-5", "bg-avatar-6"];
 
-export const thumb = (videoId: string) => `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+export const thumb = (videoId?: string) => {
+  if (!videoId) return "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=300&q=80";
+  return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+};
 
 export const fmt = (s: number) => {
   const t = Math.max(0, Math.floor(s));
