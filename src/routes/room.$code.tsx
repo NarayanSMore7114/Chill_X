@@ -42,8 +42,8 @@ function Room() {
   const cleanCode = useMemo(() => String(code || "").trim().toUpperCase(), [code]);
   const navigate = useNavigate();
 
-  // Load identity directly from storage so it never defaults to "User-Guest"
-  const [me, setMe] = useState<Listener>(() => {
+  // Load identity directly from session storage
+  const [me] = useState<Listener>(() => {
     try {
       const s = typeof window !== "undefined" ? sessionStorage.getItem("chillx-user") : null;
       if (s) {
@@ -57,6 +57,9 @@ function Room() {
   });
 
   const [queue, setQueue] = useState<Track[]>(INITIAL_QUEUE);
+  const queueRef = useRef<Track[]>(INITIAL_QUEUE);
+  queueRef.current = queue; // Always keep fresh reference without triggering re-renders
+
   const [currentId, setCurrentId] = useState<string>(INITIAL_QUEUE[0]?.id || "");
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -68,7 +71,6 @@ function Room() {
   const [copied, setCopied] = useState(false);
 
   const frame = useRef<HTMLIFrameElement>(null);
-  const isBroadcastingRef = useRef(false);
 
   const idx = Math.max(0, queue.findIndex((t) => t.id === currentId));
   const current = queue[idx];
@@ -80,43 +82,58 @@ function Room() {
     );
   };
 
-  // 1. Room mount & Socket Listeners
+  // 1. Room mount & Socket Listeners (Runs ONCE per cleanCode/username)
   useEffect(() => {
     if (!cleanCode) return;
 
     const username = me.name !== "You" ? me.name : `User-${socket.id ? socket.id.slice(0, 4) : "Guest"}`;
     socket.emit("join_room", { roomcode: cleanCode, username });
 
-    const handleMusicPlayed = ({ currentTime }: { currentTime: number }) => {
-      isBroadcastingRef.current = true;
-      setPlaying(true);
-      setTime(currentTime);
-      cmd("seekTo", [currentTime, true]);
-      cmd("playVideo");
-      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
+    // RESTORE PERSISTENT STATE & CHAT FROM NEON
+    const handleSyncState = (data: { recentMessages?: Message[]; isPlaying?: boolean; currentTime?: number }) => {
+      console.log("[CLIENT] sync_state received:", data);
+      if (data?.recentMessages && Array.isArray(data.recentMessages)) {
+        setMessages(data.recentMessages);
+      }
+      if (typeof data?.currentTime === "number" && data.currentTime > 0) {
+        setTime(data.currentTime);
+        cmd("seekTo", [data.currentTime, true]);
+      }
+      if (data?.isPlaying) {
+        setPlaying(true);
+        cmd("playVideo");
+      }
     };
 
-    const handleMusicPaused = ({ currentTime }: { currentTime: number }) => {
-      isBroadcastingRef.current = true;
+    const handleMusicPlayed = ({ currentTime }: { currentTime?: number }) => {
+      setPlaying(true);
+      if (typeof currentTime === "number") {
+        setTime(currentTime);
+        cmd("seekTo", [currentTime, true]);
+      }
+      cmd("playVideo");
+    };
+
+    const handleMusicPaused = ({ currentTime }: { currentTime?: number }) => {
       setPlaying(false);
-      if (currentTime !== undefined) {
+      if (typeof currentTime === "number") {
         setTime(currentTime);
         cmd("seekTo", [currentTime, true]);
       }
       cmd("pauseVideo");
-      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
     };
 
     const handleMusicSeeked = ({ currentTime }: { currentTime: number }) => {
-      isBroadcastingRef.current = true;
-      setTime(currentTime);
-      cmd("seekTo", [currentTime, true]);
-      setTimeout(() => { isBroadcastingRef.current = false; }, 200);
+      if (typeof currentTime === "number") {
+        setTime(currentTime);
+        cmd("seekTo", [currentTime, true]);
+      }
     };
 
     const handleTrackChanged = ({ trackIndex }: { trackIndex: number }) => {
-      if (queue[trackIndex]) {
-        setCurrentId(queue[trackIndex]!.id);
+      const target = queueRef.current[trackIndex];
+      if (target) {
+        setCurrentId(target.id);
         setTime(0);
         setPlaying(true);
       }
@@ -127,25 +144,27 @@ function Room() {
       toast.info(`Added "${song.title}" to shared queue`);
     };
 
-    // Chat listener: discard own broadcasts and map incoming messages to other users
-    const handleReceiveMessage = (msg: { senderId?: string; user: string; message: string; time?: string }) => {
+    const handleReceiveMessage = (msg: { id?: string; senderId?: string; user?: string; name?: string; message?: string; text?: string; time?: string; color?: string }) => {
       if (msg.senderId && msg.senderId === socket.id) return;
+
+      const senderName = msg.user || msg.name || "Peer";
+      const messageText = msg.message || msg.text || "";
 
       setMessages((prev) => [
         ...prev,
         {
-          id: String(Date.now() + Math.random()),
+          id: msg.id || String(Date.now() + Math.random()),
           userId: msg.senderId || "peer",
-          name: msg.user,
-          color: "bg-avatar-2",
-          text: msg.message,
+          name: senderName,
+          color: msg.color || "bg-avatar-2",
+          text: messageText,
           time: msg.time || now(),
         },
       ]);
     };
 
     const handleRoomUsers = (usersList: Array<{ id: string; username: string }>) => {
-      const mapped = usersList.map((u, i) => ({
+      const mapped = (usersList || []).map((u, i) => ({
         id: u.id,
         name: u.username,
         color: `bg-avatar-${(i % 6) + 1}`,
@@ -153,6 +172,7 @@ function Room() {
       setActiveUsers(mapped);
     };
 
+    socket.on("sync_state", handleSyncState);
     socket.on("music_played", handleMusicPlayed);
     socket.on("music_paused", handleMusicPaused);
     socket.on("music_seeked", handleMusicSeeked);
@@ -162,6 +182,7 @@ function Room() {
     socket.on("room_users_update", handleRoomUsers);
 
     return () => {
+      socket.off("sync_state", handleSyncState);
       socket.off("music_played", handleMusicPlayed);
       socket.off("music_paused", handleMusicPaused);
       socket.off("music_seeked", handleMusicSeeked);
@@ -170,9 +191,9 @@ function Room() {
       socket.off("receive_message", handleReceiveMessage);
       socket.off("room_users_update", handleRoomUsers);
     };
-  }, [cleanCode, me.name, queue]);
+  }, [cleanCode, me.name]); // queue removed to prevent endless re-joining
 
-  // 2. Playback progress tracking
+  // 2. Playback progress timer
   useEffect(() => {
     if (!playing) return;
     const interval = setInterval(() => {
@@ -260,7 +281,6 @@ function Room() {
   const send = (text: string) => {
     const currentName = me.name && me.name !== "You" ? me.name : "You";
 
-    // 1. Immediately place sender bubble into local state
     const localMsg: Message = {
       id: String(Date.now()),
       userId: "me",
@@ -271,7 +291,6 @@ function Room() {
     };
     setMessages((m) => [...m, localMsg]);
 
-    // 2. Transmit to backend
     socket.emit("send_message", {
       roomcode: cleanCode,
       message: text,
