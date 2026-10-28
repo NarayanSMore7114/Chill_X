@@ -14,23 +14,31 @@ const prisma = new PrismaClient();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Helper: Converts ISO 8601 (e.g. PT5M55S, PT1H2M10S, PT45S) into integer seconds
+// Helper: Converts ISO 8601 (e.g. PT5M55S, PT1H2M10S, PT45S, PT1H) into integer seconds
 function parseYouTubeDuration(duration) {
   if (!duration) return 180;
-  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-  if (!match) return 180;
-  const hours = parseInt(match[1] || 0, 10);
-  const minutes = parseInt(match[2] || 0, 10);
-  const seconds = parseInt(match[3] || 0, 10);
-  return hours * 3600 + minutes * 60 + seconds;
+  
+  const hoursMatch = duration.match(/(\d+)H/);
+  const minutesMatch = duration.match(/(\d+)M/);
+  const secondsMatch = duration.match(/(\d+)S/);
+
+  const hours = hoursMatch ? parseInt(hoursMatch[1], 10) : 0;
+  const minutes = minutesMatch ? parseInt(minutesMatch[1], 10) : 0;
+  const seconds = secondsMatch ? parseInt(secondsMatch[1], 10) : 0;
+
+  const total = hours * 3600 + minutes * 60 + seconds;
+  return total > 0 ? total : 180;
 }
 
-// Helper: 2-step YouTube search that fetches snippets AND real durations
+// Helper: 2-step YouTube search retrieving verified contentDetails duration
 async function searchYouTube(query) {
   const apiKey = process.env.YOUTUBE_API_KEY;
-  if (!apiKey) throw new Error("YOUTUBE_API_KEY is not defined in environment variables");
+  if (!apiKey) {
+    console.warn("[YOUTUBE API] Warning: YOUTUBE_API_KEY is not defined in environment variables");
+    return [];
+  }
 
-  // 1. Search for matching videos
+  // 1. Search for matching video IDs
   const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=10&q=${encodeURIComponent(query)}&key=${apiKey}`;
   const searchRes = await fetch(searchUrl);
   const searchData = await searchRes.json();
@@ -46,7 +54,7 @@ async function searchYouTube(query) {
 
   if (!videoIds) return [];
 
-  // 2. Fetch contentDetails to get the REAL ISO 8601 duration
+  // 2. Fetch contentDetails for true ISO 8601 durations
   const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds}&key=${apiKey}`;
   const detailsRes = await fetch(detailsUrl);
   const detailsData = await detailsRes.json();
@@ -59,8 +67,8 @@ async function searchYouTube(query) {
       url: v.id,
       title: v.snippet.title,
       artist: v.snippet.channelTitle,
-      thumbnail: v.snippet.thumbnails?.high?.url || v.snippet.thumbnails?.default?.url,
-      duration: durationSeconds, // Real duration in seconds (e.g., 355 for 5:55)
+      thumbnail: v.snippet.thumbnails?.high?.url || v.snippet.thumbnails?.medium?.url || v.snippet.thumbnails?.default?.url,
+      duration: durationSeconds, // Verified integer seconds
       votes: [],
     };
   });
@@ -72,11 +80,11 @@ app.get("/", async (req, res) => {
     await prisma.$queryRaw`SELECT 1`;
     res.send("Chill_X server is live and database is connected");
   } catch (error) {
-    res.status(500).send(`Server live, DB error: ${error.message}`);
+    res.status(200).send(`Server is live. Database note: ${error.message}`);
   }
 });
 
-// HTTP Search Route
+// REST Search Endpoint
 app.get("/api/search", async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Missing search query" });
@@ -104,6 +112,7 @@ function getOrCreateRoom(roomcode) {
       currentTrackIndex: 0,
       currentTime: 0,
       isPlaying: false,
+      hostUserId: null, // Stable tracking of the room host
       users: new Map(),
       messages: [],
       skipVotes: new Set(),
@@ -113,7 +122,7 @@ function getOrCreateRoom(roomcode) {
 }
 
 io.on("connection", (socket) => {
-  // Direct Socket Search handler (also returns real duration)
+  // Direct Socket Search handler
   socket.on("search_youtube", async (query, callback) => {
     try {
       const tracks = await searchYouTube(query);
@@ -130,21 +139,28 @@ io.on("connection", (socket) => {
   socket.on("join_room", async ({ roomcode, username }) => {
     socket.join(roomcode);
     const room = getOrCreateRoom(roomcode);
-    const isFirst = room.users.size === 0;
+
+    // If room has no active host or previous host left, assign to current socket
+    if (!room.hostUserId || !room.users.has(room.hostUserId)) {
+      room.hostUserId = socket.id;
+    }
+
+    const isHost = room.hostUserId === socket.id;
+    const canPlay = isHost;
 
     room.users.set(socket.id, {
       id: socket.id,
       username: username || "Guest",
-      isHost: isFirst,
-      canPlay: isFirst,
+      isHost,
+      canPlay,
     });
 
-    // Send initial sync state to the new client
+    // Sync room state with connecting client
     socket.emit("sync_state", {
       isPlaying: room.isPlaying,
       currentTime: room.currentTime,
-      isHost: isFirst,
-      canPlay: isFirst,
+      isHost,
+      canPlay,
       queue: room.queue,
       currentTrackId: room.queue[room.currentTrackIndex]?.id || null,
       recentMessages: room.messages.slice(-30),
@@ -155,12 +171,63 @@ io.on("connection", (socket) => {
       },
     });
 
-    // Notify room of active members
     io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
+  });
+
+  // Toggle DJ Permission (Host-only)
+  socket.on("toggle_dj_permission", ({ roomcode, targetUserId }) => {
+    const room = getOrCreateRoom(roomcode);
+    const caller = room.users.get(socket.id);
+
+    if (!caller || !caller.isHost) {
+      return socket.emit("permission_denied", { message: "Only the Room Host can change DJ permissions." });
+    }
+
+    const targetUser = room.users.get(targetUserId);
+    if (targetUser) {
+      targetUser.canPlay = !targetUser.canPlay;
+      io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
+    }
+  });
+
+  // Track Upvoting & Dynamic Queue Ordering
+  socket.on("vote_track", ({ roomcode, trackId, defaultQueue }) => {
+    const room = getOrCreateRoom(roomcode);
+
+    if (room.queue.length === 0 && Array.isArray(defaultQueue) && defaultQueue.length > 0) {
+      room.queue = [...defaultQueue];
+    }
+
+    const track = room.queue.find((t) => t.id === trackId || t.videoId === trackId);
+    if (!track) return;
+
+    if (!Array.isArray(track.votes)) {
+      track.votes = [];
+    }
+
+    const voteIdx = track.votes.indexOf(socket.id);
+    if (voteIdx > -1) {
+      track.votes.splice(voteIdx, 1);
+    } else {
+      track.votes.push(socket.id);
+    }
+
+    // Preserve the currently playing track at index 0, sort remaining tracks by votes
+    if (room.queue.length > 1) {
+      const currentTrack = room.queue[room.currentTrackIndex || 0];
+      const rest = room.queue.filter((t) => t !== currentTrack);
+
+      rest.sort((a, b) => (b.votes?.length || 0) - (a.votes?.length || 0));
+      room.queue = [currentTrack, ...rest];
+      room.currentTrackIndex = 0;
+    }
+
+    io.to(roomcode).emit("queue_updated", room.queue);
   });
 
   socket.on("add_to_queue", ({ roomcode, song }) => {
     const room = getOrCreateRoom(roomcode);
+    if (!song.votes) song.votes = [];
     room.queue.push(song);
     io.to(roomcode).emit("queue_updated", room.queue);
   });
@@ -279,6 +346,19 @@ io.on("connection", (socket) => {
       if (room.users.has(socket.id)) {
         room.users.delete(socket.id);
         room.skipVotes.delete(socket.id);
+
+        // If host disconnected, reassign to next available user
+        if (room.hostUserId === socket.id) {
+          const nextUser = room.users.values().next().value;
+          if (nextUser) {
+            room.hostUserId = nextUser.id;
+            nextUser.isHost = true;
+            nextUser.canPlay = true;
+          } else {
+            room.hostUserId = null;
+          }
+        }
+
         io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
         io.to(roomcode).emit("skip_votes_update", {
           count: room.skipVotes.size,
