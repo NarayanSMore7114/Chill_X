@@ -153,24 +153,41 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("join_room", async ({ roomcode, username }) => {
+  // Replace join_room, toggle_dj_permission, and disconnect in backend/server.js:
+
+  socket.on("join_room", async ({ roomcode, username, userId }) => {
     socket.join(roomcode);
     const room = getOrCreateRoom(roomcode);
 
-    if (!room.hostUserId || !room.users.has(room.hostUserId)) {
-      room.hostUserId = socket.id;
+    // Use persistent userId from client sessionStorage, fallback to socket.id
+    const persistentId = userId || socket.id;
+
+    // Check if this user was already in the room (e.g., page refresh or reconnect)
+    const existingUser = room.users.get(persistentId);
+
+    // Determine host: if room has no host, or this reconnecting user was the host
+    if (!room.hostUserId || room.hostUserId === persistentId) {
+      room.hostUserId = persistentId;
     }
 
-    const isHost = room.hostUserId === socket.id;
-    const canPlay = isHost;
+    const isHost = room.hostUserId === persistentId;
+    // Preserve existing DJ rights if they already had them before reload
+    const canPlay = isHost || (existingUser ? existingUser.canPlay : false);
 
-    room.users.set(socket.id, {
-      id: socket.id,
-      username: username || "Guest",
+    // Update / Rebind user to the new socket connection
+    room.users.set(persistentId, {
+      id: persistentId,
+      socketId: socket.id,
+      username: username || (existingUser ? existingUser.username : "Guest"),
       isHost,
       canPlay,
     });
 
+    // Tag the socket instance so disconnect knows exactly who this is
+    socket.userId = persistentId;
+    socket.roomcode = roomcode;
+
+    // Send initial synchronized state to reconnecting client
     socket.emit("sync_state", {
       isPlaying: room.isPlaying,
       currentTime: room.currentTime,
@@ -182,11 +199,64 @@ io.on("connection", (socket) => {
       skipVotes: {
         count: room.skipVotes.size,
         required: Math.floor(room.users.size / 2) + 1,
-        hasVoted: room.skipVotes.has(socket.id),
+        hasVoted: room.skipVotes.has(persistentId),
       },
     });
 
+    // Broadcast updated user list with preserved roles
     io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
+  });
+
+  socket.on("toggle_dj_permission", ({ roomcode, targetUserId }) => {
+    const room = getOrCreateRoom(roomcode);
+    const callerId = socket.userId || socket.id;
+
+    // Verify caller is the host using persistent ID
+    if (room.hostUserId !== callerId) {
+      return socket.emit("permission_denied", { message: "Only the Room Host can change DJ permissions." });
+    }
+
+    const targetUser = room.users.get(targetUserId);
+    if (targetUser) {
+      targetUser.canPlay = !targetUser.canPlay;
+      io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
+    }
+  });
+
+  socket.on("disconnect", () => {
+    const { roomcode, userId } = socket;
+    if (!roomcode || !userId) return;
+
+    const room = rooms.get(roomcode);
+    if (!room) return;
+
+    // Give a 3-second grace period in case the user was just reloading the tab
+    setTimeout(() => {
+      const currentUser = room.users.get(userId);
+      // If user hasn't reconnected with a newer socket within 3 seconds, remove them
+      if (currentUser && currentUser.socketId === socket.id) {
+        room.users.delete(userId);
+        room.skipVotes.delete(userId);
+
+        // If host permanently left, assign to next remaining user
+        if (room.hostUserId === userId) {
+          const nextUser = room.users.values().next().value;
+          if (nextUser) {
+            room.hostUserId = nextUser.id;
+            nextUser.isHost = true;
+            nextUser.canPlay = true;
+          } else {
+            room.hostUserId = null;
+          }
+        }
+
+        io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
+        io.to(roomcode).emit("skip_votes_update", {
+          count: room.skipVotes.size,
+          required: Math.floor(room.users.size / 2) + 1,
+        });
+      }
+    }, 3000);
   });
 
   socket.on("toggle_dj_permission", ({ roomcode, targetUserId }) => {
