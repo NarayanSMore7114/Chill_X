@@ -21,12 +21,60 @@ const io = new Server(server, {
   transports: ["polling", "websocket"],
 });
 
+// Root Healthcheck & Database Connectivity Test
 app.get("/", async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.send("Chill_X server is live and database is connected");
   } catch (err) {
     res.status(500).send(`Server live, DB error: ${err.message}`);
+  }
+});
+
+// Real-time YouTube Search API Proxy
+app.get("/api/search", async (req, res) => {
+  const query = req.query.q;
+  if (!query) {
+    return res.status(400).json({ error: "Search query is required" });
+  }
+
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "YouTube API key not configured on server" });
+  }
+
+  try {
+    // type=video is required when videoEmbeddable or videoSyndicated is passed
+    const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=15&q=${encodeURIComponent(
+      query
+    )}&type=video&videoEmbeddable=true&videoSyndicated=true&key=${apiKey}`;
+
+    const response = await fetch(ytUrl);
+    const data = await response.json();
+
+    if (data.error) {
+      console.error("[YOUTUBE API ERROR]:", data.error);
+      return res.status(500).json({ error: data.error.message });
+    }
+
+    const tracks = (data.items || []).map((item) => ({
+      id: item.id.videoId,
+      videoId: item.id.videoId,
+      url: item.id.videoId,
+      title: item.snippet.title,
+      artist: item.snippet.channelTitle,
+      thumbnail:
+        item.snippet.thumbnails?.high?.url ||
+        item.snippet.thumbnails?.default?.url ||
+        `https://img.youtube.com/vi/${item.id.videoId}/hqdefault.jpg`,
+      duration: 180,
+      votes: [],
+    }));
+
+    res.json({ tracks });
+  } catch (err) {
+    console.error("[SEARCH FETCH ERROR]:", err);
+    res.status(500).json({ error: "Failed to fetch songs from YouTube" });
   }
 });
 
@@ -40,8 +88,8 @@ const roomSkipVotes = new Map();
 
 function sortQueue(queue, currentId) {
   if (!queue || queue.length <= 1) return queue;
-  const current = queue.find((t) => t.id === currentId);
-  const remaining = queue.filter((t) => t.id !== currentId);
+  const current = queue.find((t) => (t.videoId || t.id) === currentId);
+  const remaining = queue.filter((t) => (t.videoId || t.id) !== currentId);
   remaining.sort((a, b) => (b.votes?.length || 0) - (a.votes?.length || 0));
   return current ? [current, ...remaining] : remaining;
 }
@@ -64,12 +112,17 @@ io.on("connection", (socket) => {
     if (roomSkipVotes.has(code)) {
       roomSkipVotes.get(code).clear();
     }
-    io.to(code).emit("skip_votes_update", { count: 0, required: Math.floor((roomMembers.get(code)?.length || 1) / 2) + 1 });
+    io.to(code).emit("skip_votes_update", {
+      count: 0,
+      required: Math.floor((roomMembers.get(code)?.length || 1) / 2) + 1,
+    });
 
     // Pick next track
     const roomRecord = await prisma.room.findUnique({ where: { code } }).catch(() => null);
     const currentVideoId = roomRecord?.currentTrack;
-    const currentIdx = queue.findIndex((t) => t.id === currentVideoId || t.videoId === currentVideoId);
+    const currentIdx = queue.findIndex(
+      (t) => t.id === currentVideoId || t.videoId === currentVideoId
+    );
     const nextIdx = currentIdx !== -1 ? (currentIdx + 1) % queue.length : 0;
     const nextTrack = queue[nextIdx];
 
@@ -187,7 +240,11 @@ io.on("connection", (socket) => {
         isHost,
         canPlay,
         queue: roomQueues.get(code) || null,
-        skipVotes: { count: currentSkips, required: requiredSkips, hasVoted: roomSkipVotes.get(code)?.has(socket.id) || false },
+        skipVotes: {
+          count: currentSkips,
+          required: requiredSkips,
+          hasVoted: roomSkipVotes.get(code)?.has(socket.id) || false,
+        },
       });
     } catch (err) {
       console.error(`[DB ERROR] Neon fetch failed: ${err.message}`);
@@ -284,7 +341,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Reset skip votes on manual change
     if (roomSkipVotes.has(code)) {
       roomSkipVotes.get(code).clear();
     }
@@ -307,14 +363,14 @@ io.on("connection", (socket) => {
     } catch (e) {}
   });
 
-  // 7. AUTO PLAY NEXT TRACK (Fired automatically by current DJ when track ends)
+  // 7. AUTO PLAY NEXT TRACK (Fired when track ends)
   socket.on("track_ended_auto_next", async ({ roomcode }) => {
     const code = String(roomcode || socket.data.roomcode || "").trim().toUpperCase();
     if (!code || !canControlPlayback(code)) return;
     await advanceToNextSong(code, "Auto-play");
   });
 
-  // 8. VOTE TO SKIP CURRENT SONG (Any Listener or Co-DJ)
+  // 8. VOTE TO SKIP CURRENT SONG
   socket.on("vote_to_skip", async ({ roomcode }) => {
     const code = String(roomcode || socket.data.roomcode || "").trim().toUpperCase();
     if (!code) return;
@@ -334,7 +390,6 @@ io.on("connection", (socket) => {
 
     const members = roomMembers.get(code) || [];
     const activeCount = members.length;
-    // Strict majority rule: > 50%
     const requiredSkips = Math.floor(activeCount / 2) + 1;
     const currentSkips = voters.size;
 
@@ -343,7 +398,6 @@ io.on("connection", (socket) => {
       required: requiredSkips,
     });
 
-    // Check if majority threshold is reached
     if (currentSkips >= requiredSkips) {
       await advanceToNextSong(code, `Democratic skip threshold reached (${currentSkips}/${activeCount})`);
     }
@@ -365,7 +419,11 @@ io.on("connection", (socket) => {
       roomQueues.set(code, []);
     }
     const queue = roomQueues.get(code);
-    const newSong = { ...song, votes: song.votes || [] };
+    const newSong = {
+      ...song,
+      videoId: song.videoId || song.url || song.id,
+      votes: song.votes || [],
+    };
     queue.push(newSong);
 
     io.to(code).emit("queue_updated", queue);
@@ -376,7 +434,6 @@ io.on("connection", (socket) => {
     const code = String(roomcode || socket.data.roomcode || "").trim().toUpperCase();
     if (!code || !trackId) return;
 
-    // 1. If backend memory hasn't stored the room queue yet, seed it with the client's current queue
     if (!roomQueues.has(code) || (roomQueues.get(code) || []).length === 0) {
       if (Array.isArray(defaultQueue) && defaultQueue.length > 0) {
         roomQueues.set(
@@ -390,10 +447,9 @@ io.on("connection", (socket) => {
 
     let queue = roomQueues.get(code);
 
-    // 2. Toggle voter socket ID
     let trackFound = false;
     queue = queue.map((t) => {
-      if (t.id === trackId) {
+      if (t.id === trackId || t.videoId === trackId) {
         trackFound = true;
         const votes = Array.isArray(t.votes) ? [...t.votes] : [];
         const hasVoted = votes.includes(socket.id);
@@ -407,17 +463,15 @@ io.on("connection", (socket) => {
 
     if (!trackFound) return;
 
-    // 3. Dynamically re-sort keeping the currently playing track pinned at index 0
     const sorted = sortQueue(queue, currentTrackId);
     roomQueues.set(code, sorted);
-
-    // 4. Broadcast updated queue with vote counts to all listeners in room
     io.to(code).emit("queue_updated", sorted);
   });
+
   // 12. SEND CHAT MESSAGE
   socket.on("send_message", async (data) => {
     const code = String(data?.roomcode || socket.data.roomcode || "").trim().toUpperCase();
-    const text = typeof data === "string" ? data : (data?.message || data?.text || "");
+    const text = typeof data === "string" ? data : data?.message || data?.text || "";
     const username = data?.username || socket.data.username || "Guest";
 
     if (!code || !text) return;
@@ -462,7 +516,6 @@ io.on("connection", (socket) => {
       const wasHost = members.find((m) => m.id === socket.id)?.isHost;
       members = members.filter((m) => m.id !== socket.id);
 
-      // Clean up user's skip vote
       if (roomSkipVotes.has(code)) {
         roomSkipVotes.get(code).delete(socket.id);
         const requiredSkips = Math.floor(members.length / 2) + 1;
