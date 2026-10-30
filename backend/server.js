@@ -143,6 +143,14 @@ function getOrCreateRoom(roomcode) {
   return rooms.get(roomcode);
 }
 
+// Resolve the participant by persistent user ID and reject stale socket connections.
+function getSocketUser(room, socket) {
+  if (!room || !socket.userId) return null;
+  const user = room.users.get(socket.userId);
+  if (!user || user.socketId !== socket.id) return null;
+  return user;
+}
+
 io.on("connection", (socket) => {
   socket.on("search_youtube", async (query, callback) => {
     try {
@@ -259,21 +267,6 @@ io.on("connection", (socket) => {
     }, 3000);
   });
 
-  socket.on("toggle_dj_permission", ({ roomcode, targetUserId }) => {
-    const room = getOrCreateRoom(roomcode);
-    const caller = room.users.get(socket.id);
-
-    if (!caller || !caller.isHost) {
-      return socket.emit("permission_denied", { message: "Only the Room Host can change DJ permissions." });
-    }
-
-    const targetUser = room.users.get(targetUserId);
-    if (targetUser) {
-      targetUser.canPlay = !targetUser.canPlay;
-      io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
-    }
-  });
-
   // Track Upvoting & Dynamic Queue Ordering
   socket.on("vote_track", ({ roomcode, trackId, defaultQueue }) => {
     const room = getOrCreateRoom(roomcode);
@@ -287,11 +280,11 @@ io.on("connection", (socket) => {
 
     if (!Array.isArray(track.votes)) track.votes = [];
 
-    const voteIdx = track.votes.indexOf(socket.id);
+    const voteIdx = track.votes.indexOf(socket.userId);
     if (voteIdx > -1) {
       track.votes.splice(voteIdx, 1);
     } else {
-      track.votes.push(socket.id);
+      track.votes.push(socket.userId);
     }
 
     if (room.queue.length > 1) {
@@ -309,7 +302,7 @@ io.on("connection", (socket) => {
   // Remove track from queue (Host or Co-DJ)
   socket.on("remove_from_queue", ({ roomcode, trackId }) => {
     const room = getOrCreateRoom(roomcode);
-    const caller = room.users.get(socket.id);
+    const caller = getSocketUser(room, socket);
     if (!caller || (!caller.isHost && !caller.canPlay)) {
       return socket.emit("permission_denied", { message: "Only Host or DJs can remove songs." });
     }
@@ -354,7 +347,7 @@ io.on("connection", (socket) => {
 
   socket.on("play_music", ({ roomcode, currentTime }) => {
     const room = getOrCreateRoom(roomcode);
-    const user = room.users.get(socket.id);
+    const user = getSocketUser(room, socket);
     if (!user?.canPlay && !user?.isHost) return;
 
     room.isPlaying = true;
@@ -364,7 +357,7 @@ io.on("connection", (socket) => {
 
   socket.on("pause_music", ({ roomcode, currentTime }) => {
     const room = getOrCreateRoom(roomcode);
-    const user = room.users.get(socket.id);
+    const user = getSocketUser(room, socket);
     if (!user?.canPlay && !user?.isHost) return;
 
     room.isPlaying = false;
@@ -374,7 +367,7 @@ io.on("connection", (socket) => {
 
   socket.on("seek_music", ({ roomcode, currentTime }) => {
     const room = getOrCreateRoom(roomcode);
-    const user = room.users.get(socket.id);
+    const user = getSocketUser(room, socket);
     if (!user?.canPlay && !user?.isHost) return;
 
     room.currentTime = currentTime;
@@ -389,7 +382,7 @@ io.on("connection", (socket) => {
 
   socket.on("change_track", ({ roomcode, trackIndex }) => {
     const room = getOrCreateRoom(roomcode);
-    const user = room.users.get(socket.id);
+    const user = getSocketUser(room, socket);
     if (!user?.canPlay && !user?.isHost) return;
 
     room.currentTrackIndex = trackIndex;
@@ -422,10 +415,10 @@ io.on("connection", (socket) => {
 
   socket.on("vote_to_skip", ({ roomcode }) => {
     const room = getOrCreateRoom(roomcode);
-    if (room.skipVotes.has(socket.id)) {
-      room.skipVotes.delete(socket.id);
+    if (room.skipVotes.has(socket.userId)) {
+      room.skipVotes.delete(socket.userId);
     } else {
-      room.skipVotes.add(socket.id);
+      room.skipVotes.add(socket.userId);
     }
 
     const count = room.skipVotes.size;
@@ -461,31 +454,7 @@ io.on("connection", (socket) => {
     io.to(roomcode).emit("receive_message", msg);
   });
 
-  socket.on("disconnect", () => {
-    for (const [roomcode, room] of rooms.entries()) {
-      if (room.users.has(socket.id)) {
-        room.users.delete(socket.id);
-        room.skipVotes.delete(socket.id);
 
-        if (room.hostUserId === socket.id) {
-          const nextUser = room.users.values().next().value;
-          if (nextUser) {
-            room.hostUserId = nextUser.id;
-            nextUser.isHost = true;
-            nextUser.canPlay = true;
-          } else {
-            room.hostUserId = null;
-          }
-        }
-
-        io.to(roomcode).emit("room_users_update", Array.from(room.users.values()));
-        io.to(roomcode).emit("skip_votes_update", {
-          count: room.skipVotes.size,
-          required: Math.floor(room.users.size / 2) + 1,
-        });
-      }
-    }
-  });
 });
 
 const PORT = process.env.PORT || 8000;
